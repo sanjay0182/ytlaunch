@@ -139,7 +139,7 @@ function buildHeaders(req, host, ME, bodyLen) {
 
 function handleResponse(pr, req, res, host, ME, path) {
   const ct = String(pr.headers['content-type'] || '');
-  if (!path.startsWith('/videoplayback')) note('RES', pr.statusCode, host + path.slice(0, 50), ct.slice(0, 28), 'hdrBytes=' + JSON.stringify(pr.headers).length);
+  if (!path.startsWith('/videoplayback')) note('RES', pr.statusCode, host + path.slice(0, 50), ct.slice(0, 28), 'hdrBytes=' + JSON.stringify(pr.headers).length + (pr.headers.location ? ' LOC=' + String(pr.headers.location).slice(0, 90) : ''));
   const out = {};
   for (const [k, v] of Object.entries(pr.headers)) if (!DROP_RES.has(k)) out[k] = v;
   if (out.location) out.location = rewriteText(String(out.location), ME);
@@ -214,7 +214,7 @@ const server = http.createServer((req, res) => {
   if (url === '/__diag') {
     Promise.all([probe('www.youtube.com'), probe('m.youtube.com'), probe('googleapis.com')]).then(r => {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ version: 'diag-3', recent_logs: LOGS.slice(-40), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
+      res.end(JSON.stringify({ version: 'diag-4', recent_logs: LOGS.slice(-40), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
     });
     return;
   }
@@ -266,20 +266,37 @@ const server = http.createServer((req, res) => {
   const hit = req.method === 'GET' ? cache.get(ME + host + path) : null;
   if (hit) { res.writeHead(hit.status, hit.out); return res.end(hit.body); }
 
-  const send = (bodyBuf) => {
-    const headers = buildHeaders(req, host, ME, bodyBuf ? bodyBuf.length : undefined);
-    const pq = https.request({ host, port: 443, method: req.method, path, headers, agent, servername: host }, pr => handleResponse(pr, req, res, host, ME, path));
+  let pqCur = null;
+  res.on('close', () => { if (!res.writableEnded) note('[CLIENT CLOSED EARLY]', host + path.slice(0, 60)); if (pqCur) pqCur.destroy(); });
+  const MAINH = /^(?:www\.|m\.)?youtube\.com$/i;
+  // run(): upstream request; if YouTube just bounces between www<->m for the SAME path we follow it here
+  // (otherwise the rewritten redirect points back at this proxy and loops forever in the browser)
+  const run = (h, hop, bodyBuf) => {
+    const headers = buildHeaders(req, h, ME, bodyBuf ? bodyBuf.length : undefined);
+    const pq = https.request({ host: h, port: 443, method: req.method, path, headers, agent, servername: h }, pr => {
+      const sc = pr.statusCode, loc = pr.headers.location;
+      if (hop < 4 && loc && sc >= 301 && sc <= 308 && !bodyBuf && (req.method === 'GET' || req.method === 'HEAD')) {
+        let u = null; try { u = new URL(loc, 'https://' + h); } catch (e) { /* ignore */ }
+        if (u && MAINH.test(u.hostname) && u.hostname.toLowerCase() !== h && u.pathname === path.split('?')[0]) {
+          note('FLIP', h, '->', u.hostname.toLowerCase(), path.slice(0, 50));
+          pr.resume();
+          return run(u.hostname.toLowerCase(), hop + 1, bodyBuf);
+        }
+      }
+      handleResponse(pr, req, res, h, ME, path);
+    });
+    pqCur = pq;
     pq.setTimeout(30000, () => pq.destroy(new Error('upstream idle timeout 30s')));
     pq.on('error', e => {
-      note('[UPSTREAM ERROR]', req.method, host + path.slice(0, 60), '->', e.code || '', e.message);
+      note('[UPSTREAM ERROR]', req.method, h + path.slice(0, 60), '->', e.code || '', e.message);
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
       res.end('proxy error: ' + e.message);
     });
-    res.on('close', () => { if (!res.writableEnded) note('[CLIENT CLOSED EARLY]', host + path.slice(0, 60)); pq.destroy(); });
     if (bodyBuf) pq.end(bodyBuf);
     else if (req.method === 'GET' || req.method === 'HEAD') pq.end();
     else req.pipe(pq);
   };
+  const send = (bodyBuf) => run(host, 0, bodyBuf);
 
   const isJsonReq = /json/i.test(req.headers['content-type'] || '');
   if (req.method !== 'GET' && req.method !== 'HEAD' && isJsonReq) {
