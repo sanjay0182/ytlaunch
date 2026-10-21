@@ -3,6 +3,7 @@
 // client -> this server -> youtube.com ; ads are pruned from API JSON + ad URLs are blocked.
 const http = require('http');
 const https = require('https');
+const zlib = require('zlib');
 
 const PORT = process.env.PORT || 8080;
 // phone/tablet browsers get m.youtube.com, desktop/TV get www.youtube.com (same as real YouTube does)
@@ -101,6 +102,10 @@ const DROP_REQ = new Set([
   'host', 'connection', 'accept-encoding', 'x-real-ip', 'forwarded', 'via', 'cf-connecting-ip',
   'cdn-loop', 'x-request-id', 'content-length'
 ]);
+const KEEP_RES = new Set(['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control', 'expires',
+  'last-modified', 'etag', 'location', 'set-cookie', 'content-disposition', 'content-language', 'content-encoding', 'vary', 'age',
+  'retry-after', 'x-content-type-options', 'access-control-allow-origin', 'access-control-allow-credentials',
+  'access-control-allow-headers', 'access-control-allow-methods', 'access-control-expose-headers']);
 const TEXTUAL = /^(?:text\/(?:html|css|xml|javascript)|application\/(?:javascript|x-javascript|ecmascript|json))/i;
 
 const cache = new Map(); // small cache for static /s/ files (player js, css)
@@ -112,7 +117,7 @@ function cacheSet(k, v) {
 function buildHeaders(req, host, ME, bodyLen) {
   const h = {};
   for (const [k, v] of Object.entries(req.headers)) {
-    if (DROP_REQ.has(k) || k.startsWith('sec-fetch-') || k.startsWith('x-forwarded') || k.startsWith('x-envoy')) continue;
+    if (DROP_REQ.has(k) || k.startsWith('sec-fetch-') || k.startsWith('cf-') || k === 'true-client-ip' || k.startsWith('x-forwarded') || k.startsWith('x-envoy')) continue;
     h[k] = v;
   }
   h.host = host;
@@ -139,9 +144,9 @@ function buildHeaders(req, host, ME, bodyLen) {
 
 function handleResponse(pr, req, res, host, ME, path) {
   const ct = String(pr.headers['content-type'] || '');
-  if (!path.startsWith('/videoplayback')) note('RES', pr.statusCode, host + path.slice(0, 50), ct.slice(0, 28), 'hdrBytes=' + JSON.stringify(pr.headers).length + (pr.headers.location ? ' LOC=' + String(pr.headers.location).slice(0, 90) : ''));
+  if (!path.startsWith('/videoplayback')) note('RES', pr.statusCode, host + path.slice(0, 50), ct.slice(0, 28), 'hdrBytes=' + JSON.stringify(pr.headers).length + '->' + Object.entries(pr.headers).filter(([k, v]) => KEEP_RES.has(k)).reduce((a, [k, v]) => a + k.length + JSON.stringify(v).length, 0) + (pr.headers.location ? ' LOC=' + String(pr.headers.location).slice(0, 90) : ''));
   const out = {};
-  for (const [k, v] of Object.entries(pr.headers)) if (!DROP_RES.has(k)) out[k] = v;
+  for (const [k, v] of Object.entries(pr.headers)) if (KEEP_RES.has(k) && JSON.stringify(v).length < 4200) out[k] = v;
   if (out.location) out.location = rewriteText(String(out.location), ME);
   if (out['set-cookie']) out['set-cookie'] = [].concat(out['set-cookie']).map(c => c.replace(/;\s*domain=[^;]*/i, ''));
   if (out['access-control-allow-origin']) {
@@ -169,13 +174,22 @@ function handleResponse(pr, req, res, host, ME, path) {
       const tag = '<script>' + CLIENT + '</script>';
       text = /<head[^>]*>/i.test(text) ? text.replace(/<head[^>]*>/i, m => m + tag) : tag + text;
     }
-    const body = Buffer.from(text, 'utf8');
+    let body = Buffer.from(text, 'utf8');
     out['content-length'] = body.length;
     delete out.etag;
-    if (pr.statusCode === 200 && path.startsWith('/s/')) cacheSet(ME + host + path, { status: 200, out, body });
+    delete out['content-encoding'];
+    if (pr.statusCode === 200 && path.startsWith('/s/')) cacheSet(ME + host + path, { status: 200, out: Object.assign({}, out), body });
+    const rawLen = body.length;
+    // gzip big text for the client (YouTube HTML is ~350KB; phone data is slow)
+    if (body.length > 1024 && /\bgzip\b/i.test(String(req.headers['accept-encoding'] || ''))) {
+      body = zlib.gzipSync(body, { level: 6 });
+      out['content-encoding'] = 'gzip';
+      out['content-length'] = body.length;
+      out.vary = 'Accept-Encoding';
+    }
     res.writeHead(pr.statusCode, out);
     res.end(body);
-    note('SENT', pr.statusCode, 'body=' + body.length);
+    note('SENT', pr.statusCode, 'body=' + rawLen, body.length !== rawLen ? 'gz=' + body.length : '');
   } catch (e) { note('[HANDLE ERROR]', e.message); if (!res.headersSent) { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('handle error: ' + e.message); } else res.destroy(); } });
   pr.on('error', e => { note('[UPSTREAM BODY ERROR]', e.message); res.destroy(); });
 }
@@ -214,7 +228,7 @@ const server = http.createServer((req, res) => {
   if (url === '/__diag') {
     Promise.all([probe('www.youtube.com'), probe('m.youtube.com'), probe('googleapis.com')]).then(r => {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ version: 'diag-4', recent_logs: LOGS.slice(-40), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
+      res.end(JSON.stringify({ version: 'diag-6', recent_logs: LOGS.slice(-40), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
     });
     return;
   }
@@ -233,7 +247,7 @@ const server = http.createServer((req, res) => {
           const raw = Buffer.concat(ch).toString('utf8');
           const hdrs = {}; let total = 0;
           for (const [k, v] of Object.entries(pr.headers)) { const l = JSON.stringify(v).length; total += k.length + l; hdrs[k] = l; }
-          const kept = Object.keys(pr.headers).filter(k => !DROP_RES.has(k));
+          const kept = Object.keys(pr.headers).filter(k => KEEP_RES.has(k));
           done({ host: th, path: tp, status: pr.statusCode, ms: Date.now() - t0, content_type: pr.headers['content-type'] || null,
             content_encoding: pr.headers['content-encoding'] || null, upstream_header_bytes: total, header_value_sizes: hdrs,
             headers_we_would_send: kept, body_bytes: Buffer.byteLength(raw), rewritten_bytes: Buffer.byteLength(rewriteText(raw, ME)),
@@ -283,10 +297,11 @@ const server = http.createServer((req, res) => {
           return run(u.hostname.toLowerCase(), hop + 1, bodyBuf);
         }
       }
+      pq.setTimeout(0);
       handleResponse(pr, req, res, h, ME, path);
     });
     pqCur = pq;
-    pq.setTimeout(30000, () => pq.destroy(new Error('upstream idle timeout 30s')));
+    pq.setTimeout(30000, () => pq.destroy(new Error('upstream timeout 30s (no response)')));
     pq.on('error', e => {
       note('[UPSTREAM ERROR]', req.method, h + path.slice(0, 60), '->', e.code || '', e.message);
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
