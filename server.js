@@ -70,6 +70,7 @@ var HOSTRE=/^https?:\/\/((?:[a-z0-9-]+\.)*(?:youtube\.com|googlevideo\.com|googl
 var ADB=/^https?:\/\/[^\/]*(doubleclick\.net|googlesyndication\.com|googleadservices\.com|adservice\.google\.|pagead2\.)/i;
 function fix(u){try{
  if(typeof u!=='string')return u;
+ if(PFX){if(u[0]==='/'&&u[1]!=='/'&&u.indexOf('/__p/')!==0)return PFX+u;if(u.indexOf(location.origin+'/')===0&&u.indexOf(location.origin+'/__p/')!==0)return location.origin+PFX+u.slice(location.origin.length)}
  if(u.slice(0,2)==='//')u='https:'+u;
  if(ADB.test(u))return location.origin+'/__blocked';
  var m=u.match(HOSTRE);if(!m)return u;
@@ -77,6 +78,7 @@ function fix(u){try{
  if(h==='www.youtube.com'||h==='youtube.com'||h==='m.youtube.com')return location.origin+rest;
  return location.origin+'/__p/'+h+rest;
 }catch(e){return u}}
+var PFX=(location.pathname.match(/^\/__p\/[^\/]+/)||[''])[0];
 var of=window.fetch;
 window.fetch=function(i,o){
  if(typeof i==='string')i=fix(i);
@@ -99,7 +101,7 @@ function go(u,why){_go=1;ping(why+' '+u);setTimeout(function(){_go=0},2000);loca
 ping('start '+location.pathname+location.search.slice(0,40));
 // 1) link clicks: do a normal page load instead of YouTube's in-page navigation (which stays blank behind the proxy)
 window.addEventListener('click',function(e){try{
- if(e.button||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
+ if(PFX||e.button||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
  var path=e.composedPath?e.composedPath():[e.target],a=null;
  for(var i=0;i<path.length;i++){var el=path[i];if(el&&el.tagName==='A'&&el.href){a=el;break}}
  if(!a||(a.target&&a.target!=='_self')||a.hasAttribute('download'))return;
@@ -109,7 +111,7 @@ window.addEventListener('click',function(e){try{
 }catch(x){}},true);
 // 1b) search form: same thing (YouTube cancels the submit and then does its own request, which can fail)
 window.addEventListener('submit',function(e){try{
- var f=e.target;if(!f||f.tagName!=='FORM'||String(f.getAttribute('method')||'get').toLowerCase()!=='get')return;
+ var f=e.target;if(PFX||!f||f.tagName!=='FORM'||String(f.getAttribute('method')||'get').toLowerCase()!=='get')return;
  var n=new URL(f.getAttribute('action')||location.href,location.href);
  if(n.origin!==location.origin||n.pathname!=='/results')return;
  var p=new URLSearchParams();new FormData(f).forEach(function(v,k){if(typeof v==='string')p.append(k,v)});
@@ -121,12 +123,12 @@ window.addEventListener('submit',function(e){try{
 var _ps=history.pushState;
 history.pushState=function(st,ti,u){
  try{if(u){u=fix(String(u));arguments[2]=u;var n=new URL(u,location.href);
-  if(n.origin===location.origin&&(n.pathname+n.search)!==(location.pathname+location.search)&&navOK()){go(n.href,'push');return}}}catch(e){}
+  if(n.origin===location.origin&&(n.pathname+n.search)!==(location.pathname+location.search)&&!PFX&&navOK()){go(n.href,'push');return}}}catch(e){}
  return _ps.apply(this,arguments)};
 var _rs=history.replaceState;
 history.replaceState=function(st,ti,u){try{if(u)arguments[2]=fix(String(u))}catch(e){}return _rs.apply(this,arguments)};
 // 3) safety net, any other way YouTube changes the page address (page, video id or search text): reload = same as manual refresh
-setInterval(function(){if(_go)return;var k=K();if(k!==_k){_k=k;if(navOK()){_go=1;ping('reload '+location.pathname);location.reload()}}},250);
+setInterval(function(){if(_go||PFX)return;var k=K();if(k!==_k){_k=k;if(navOK()){_go=1;ping('reload '+location.pathname);location.reload()}}},250);
 })();`;
 
 const DROP_RES = new Set([
@@ -209,7 +211,8 @@ function handleResponse(pr, req, res, host, ME, path) {
     if (isJson && /\/youtubei\/|\/api\//.test(path)) {
       try { const j = JSON.parse(text); prune(j); text = JSON.stringify(j); } catch (e) { /* leave as is */ }
     }
-    text = rewriteText(text, ME);
+    if (!/^\)\]\}'/.test(text)) text = rewriteText(text, ME); // google batchexecute replies carry byte-lengths: never change their size
+    if (/text\/html/i.test(ct) && !/^(?:www\.|m\.)?youtube\.com$/i.test(host)) text = text.replace(/(\s(?:href|src|action)\s*=\s*["'])\/(?![\/]|__p\/)/gi, '$1/__p/' + host + '/');
     if (/text\/html/i.test(ct)) {
       const tag = '<script>' + CLIENT + '</script>';
       text = /<head[^>]*>/i.test(text) ? text.replace(/<head[^>]*>/i, m => m + tag) : tag + text;
@@ -268,7 +271,7 @@ const server = http.createServer((req, res) => {
   if (url === '/__diag') {
     Promise.all([probe('www.youtube.com'), probe('m.youtube.com'), probe('googleapis.com')]).then(r => {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ version: 'diag-10', recent_logs: LOGS.slice(-40), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
+      res.end(JSON.stringify({ version: 'diag-11', recent_logs: LOGS.slice(-40), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
     });
     return;
   }
