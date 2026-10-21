@@ -178,10 +178,37 @@ function handleResponse(pr, req, res, host, ME, path) {
   pr.on('error', () => res.destroy());
 }
 
+
+// ---- never crash, always log (blitz logs tab will show these) ----
+process.on('uncaughtException', e => console.error('[uncaught]', e && e.stack || e));
+process.on('unhandledRejection', e => console.error('[unhandled]', e && e.stack || e));
+
+// ---- /__diag : open in browser, shows WHY upstream fails (always HTTP 200 so Cloudflare shows the text) ----
+function probe(host) {
+  return new Promise(resolve => {
+    const t0 = Date.now();
+    const r = https.request({ host, port: 443, method: 'GET', path: '/', timeout: 12000,
+      headers: { host, 'user-agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36', 'accept-encoding': 'identity' } }, pr => {
+      pr.resume();
+      resolve({ host, ok: true, status: pr.statusCode, location: pr.headers.location || null, ms: Date.now() - t0 });
+    });
+    r.on('timeout', () => r.destroy(new Error('timeout 12s')));
+    r.on('error', e => resolve({ host, ok: false, error: e.message, code: e.code, ms: Date.now() - t0 }));
+    r.end();
+  });
+}
+
 const server = http.createServer((req, res) => {
   const ME = req.headers.host;
   const url = req.url;
 
+  if (url === '/__diag') {
+    Promise.all([probe('www.youtube.com'), probe('m.youtube.com'), probe('googleapis.com')]).then(r => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
+    });
+    return;
+  }
   if (url === '/__blocked') { res.writeHead(204); return res.end(); }
   if (url === '/' && /uptime check/i.test(req.headers['user-agent'] || '')) {
     res.writeHead(200, { 'content-type': 'text/plain' });
@@ -205,7 +232,9 @@ const server = http.createServer((req, res) => {
   const send = (bodyBuf) => {
     const headers = buildHeaders(req, host, ME, bodyBuf ? bodyBuf.length : undefined);
     const pq = https.request({ host, port: 443, method: req.method, path, headers, agent, servername: host }, pr => handleResponse(pr, req, res, host, ME, path));
+    pq.setTimeout(30000, () => pq.destroy(new Error('upstream idle timeout 30s')));
     pq.on('error', e => {
+      console.error('[upstream error]', req.method, host + path.slice(0, 80), '->', e.code || '', e.message);
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
       res.end('proxy error: ' + e.message);
     });
@@ -230,4 +259,11 @@ const server = http.createServer((req, res) => {
 
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
-server.listen(PORT, () => console.log('ytproxy listening on ' + PORT));
+const LISTEN_PORTS = [...new Set([Number(PORT), 8080])];
+server.on('error', e => console.error('[server error]', e.message));
+// listen on the platform PORT and on 8080 (whichever blitz routes to will work)
+LISTEN_PORTS.forEach((pt, i) => {
+  const srv = i === 0 ? server : http.createServer(server.listeners('request')[0]);
+  if (i) { srv.keepAliveTimeout = 65000; srv.headersTimeout = 66000; srv.on('error', e => console.error('[extra port ' + pt + ']', e.message)); }
+  srv.listen(pt, () => console.log('ytproxy listening on ' + pt));
+});
