@@ -99,7 +99,7 @@ function K(){try{var p=new URLSearchParams(location.search);return location.path
 var _k=K();
 function go(u,why){_go=1;ping(why+' '+u);setTimeout(function(){_go=0},2000);location.assign(u)}
 ping('start '+location.pathname+location.search.slice(0,40));
-window.addEventListener('error',function(e){var t=e.target;if(t&&t!==window&&(t.src||t.href))ping('LOADFAIL '+String(t.src||t.href).slice(-80));else ping('JSERR '+String(e.message||'').slice(0,80)+' @'+String(e.filename||'').slice(-40)+':'+e.lineno)},true);
+window.addEventListener('error',function(e){var t=e.target;if(t&&t!==window&&(t.src||t.href)){var lu=String(t.src||t.href);ping('LOADFAIL '+t.tagName+' '+lu.slice(0,100));ping('LOADTAIL '+lu.slice(-100));if(t.tagName==='SCRIPT')try{of.call(window,lu,{mode:'no-cors',credentials:'omit'}).then(function(r){ping('REFETCH ok '+r.type+' '+r.status)},function(er){ping('REFETCH fail '+er)})}catch(x){}}else ping('JSERR '+String(e.message||'').slice(0,80)+' @'+String(e.filename||'').slice(-40)+':'+e.lineno)},true);
 window.addEventListener('unhandledrejection',function(e){ping('REJECT '+String(e.reason&&(e.reason.message||e.reason)).slice(0,100))});
 // 1) link clicks: do a normal page load instead of YouTube's in-page navigation (which stays blank behind the proxy)
 window.addEventListener('click',function(e){try{
@@ -245,7 +245,7 @@ function handleResponse(pr, req, res, host, ME, path) {
 const LOGS = [];
 function note(...a) {
   const line = new Date().toISOString().slice(11, 23) + ' ' + a.join(' ');
-  LOGS.push(line); if (LOGS.length > 120) LOGS.shift();
+  LOGS.push(line); if (LOGS.length > 200) LOGS.shift();
   console.log(line);
 }
 process.on('uncaughtException', e => note('[UNCAUGHT]', String(e && e.stack || e).replace(/\n/g, ' | ')));
@@ -269,12 +269,12 @@ function probe(host) {
 const server = http.createServer((req, res) => {
   const ME = req.headers.host;
   const url = req.url;
-  if (!url.startsWith('/__') && !url.startsWith('/videoplayback')) note('REQ', req.method, url.slice(0, 70), '|', (req.headers['user-agent'] || '').slice(0, 45));
+  if ((!url.startsWith('/__') || url.startsWith('/__p/')) && !url.startsWith('/videoplayback')) note('REQ', req.method, url.slice(0, 70), '|', (req.headers['user-agent'] || '').slice(0, 45));
 
   if (url === '/__diag') {
     Promise.all([probe('www.youtube.com'), probe('m.youtube.com'), probe('googleapis.com')]).then(r => {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ version: 'diag-13', recent_logs: LOGS.slice(-70), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
+      res.end(JSON.stringify({ version: 'diag-14', recent_logs: LOGS.slice(-90), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
     });
     return;
   }
@@ -323,7 +323,7 @@ const server = http.createServer((req, res) => {
     path = m[2] || '/';
     if (path[0] !== '/') path = '/' + path;
   }
-  if (!ALLOW.test(host)) { res.writeHead(403); return res.end('blocked host'); }
+  if (!ALLOW.test(host)) { note('BLOCKED-HOST', host, path.slice(0, 60)); res.writeHead(403); return res.end('blocked host'); }
 
   const hit = req.method === 'GET' ? cache.get(ME + host + path) : null;
   if (hit) { res.writeHead(hit.status, hit.out); return res.end(hit.body); }
