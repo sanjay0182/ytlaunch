@@ -162,7 +162,10 @@ function buildHeaders(req, host, ME, bodyLen) {
   if (bodyLen !== undefined) h['content-length'] = String(bodyLen);
   else if (req.headers['content-length']) h['content-length'] = req.headers['content-length'];
   const base = baseHost(req);
-  if (h.origin) h.origin = 'https://' + base;
+  if (h.origin) {
+    const pm = String(req.headers.referer || '').match(/^https?:\/\/[^\/]+\/__p\/([^\/?#]+)/);
+    h.origin = 'https://' + (pm && ALLOW.test(pm[1]) ? pm[1].toLowerCase() : base);
+  }
   if (h.referer) {
     let r = h.referer;
     if (r.includes('://' + ME + '/__p/')) r = r.replace('://' + ME + '/__p/', '://');
@@ -265,7 +268,7 @@ const server = http.createServer((req, res) => {
   if (url === '/__diag') {
     Promise.all([probe('www.youtube.com'), probe('m.youtube.com'), probe('googleapis.com')]).then(r => {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ version: 'diag-9', recent_logs: LOGS.slice(-40), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
+      res.end(JSON.stringify({ version: 'diag-10', recent_logs: LOGS.slice(-40), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
     });
     return;
   }
@@ -352,7 +355,7 @@ const server = http.createServer((req, res) => {
   };
   const send = (bodyBuf) => run(host, 0, bodyBuf);
 
-  const isJsonReq = /json/i.test(req.headers['content-type'] || '');
+  const isJsonReq = /json|x-www-form-urlencoded|text\/plain/i.test(req.headers['content-type'] || '');
   if (req.method !== 'GET' && req.method !== 'HEAD' && isJsonReq) {
     const chunks = [];
     req.on('data', c => chunks.push(c));
