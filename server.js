@@ -84,9 +84,9 @@ window.fetch=function(i,o){
  if(typeof i==='string')i=fix(i);
  else if(typeof URL!=='undefined'&&i instanceof URL)i=fix(i.href);
  else if(typeof Request!=='undefined'&&i instanceof Request){var nu=fix(i.url);if(nu!==i.url){try{i=new Request(nu,i)}catch(e){}}}
- return of.call(this,i,o)};
+ var p=of.call(this,i,o);if(PFX)p.then(function(r){if(!r.ok)ping('FETCH '+r.status+' '+String(r.url).slice(-70))},function(er){ping('FETCHERR '+er)});return p};
 var oo=XMLHttpRequest.prototype.open;
-XMLHttpRequest.prototype.open=function(m,u){arguments[1]=fix(String(u));return oo.apply(this,arguments)};
+XMLHttpRequest.prototype.open=function(m,u){arguments[1]=fix(String(u));if(PFX){var x=this,uu=arguments[1];this.addEventListener('loadend',function(){if(x.status!==200)ping('XHR '+x.status+' '+uu.slice(-70))})}return oo.apply(this,arguments)};
 if(navigator.sendBeacon){var ob=navigator.sendBeacon.bind(navigator);navigator.sendBeacon=function(u,d){return ob(fix(String(u)),d)}}
 function trap(n){var v;try{Object.defineProperty(window,n,{configurable:true,get:function(){return v},set:function(x){try{prune(x)}catch(e){}v=x}})}catch(e){}}
 trap('ytInitialPlayerResponse');trap('ytInitialData');
@@ -99,6 +99,8 @@ function K(){try{var p=new URLSearchParams(location.search);return location.path
 var _k=K();
 function go(u,why){_go=1;ping(why+' '+u);setTimeout(function(){_go=0},2000);location.assign(u)}
 ping('start '+location.pathname+location.search.slice(0,40));
+window.addEventListener('error',function(e){var t=e.target;if(t&&t!==window&&(t.src||t.href))ping('LOADFAIL '+String(t.src||t.href).slice(-80));else ping('JSERR '+String(e.message||'').slice(0,80)+' @'+String(e.filename||'').slice(-40)+':'+e.lineno)},true);
+window.addEventListener('unhandledrejection',function(e){ping('REJECT '+String(e.reason&&(e.reason.message||e.reason)).slice(0,100))});
 // 1) link clicks: do a normal page load instead of YouTube's in-page navigation (which stays blank behind the proxy)
 window.addEventListener('click',function(e){try{
  if(PFX||e.button||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
@@ -164,13 +166,14 @@ function buildHeaders(req, host, ME, bodyLen) {
   if (bodyLen !== undefined) h['content-length'] = String(bodyLen);
   else if (req.headers['content-length']) h['content-length'] = req.headers['content-length'];
   const base = baseHost(req);
-  if (h.origin) {
-    const pm = String(req.headers.referer || '').match(/^https?:\/\/[^\/]+\/__p\/([^\/?#]+)/);
-    h.origin = 'https://' + (pm && ALLOW.test(pm[1]) ? pm[1].toLowerCase() : base);
-  }
+  const MAINRE = /^(?:www\.|m\.)?youtube\.com$/i;
+  const pm = String(req.headers.referer || '').match(/^https?:\/\/[^\/]+\/__p\/([^\/?#]+)/);
+  const pageHost = pm && ALLOW.test(pm[1]) ? pm[1].toLowerCase() : (MAINRE.test(host) ? base : host);
+  if (h.origin) h.origin = 'https://' + pageHost;
   if (h.referer) {
     let r = h.referer;
     if (r.includes('://' + ME + '/__p/')) r = r.replace('://' + ME + '/__p/', '://');
+    else if (!MAINRE.test(host)) r = 'https://' + host + '/';
     else r = r.replace('://' + ME, '://' + base);
     h.referer = r;
   }
@@ -271,7 +274,7 @@ const server = http.createServer((req, res) => {
   if (url === '/__diag') {
     Promise.all([probe('www.youtube.com'), probe('m.youtube.com'), probe('googleapis.com')]).then(r => {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ version: 'diag-11', recent_logs: LOGS.slice(-40), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
+      res.end(JSON.stringify({ version: 'diag-13', recent_logs: LOGS.slice(-70), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
     });
     return;
   }
@@ -304,6 +307,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (url.startsWith('/__hi')) { note('[CLIENT]', decodeURIComponent(url.slice(8)).slice(0, 120)); res.writeHead(204); return res.end(); }
+  if (/^(?:\/__p\/[^\/]+)?\/cdn-cgi\//.test(url)) { res.writeHead(204); return res.end(); } // cloudflare's own analytics beacon, not for google
   if (url === '/__blocked') { res.writeHead(204); return res.end(); }
   if (url === '/' && /uptime check/i.test(req.headers['user-agent'] || '')) {
     res.writeHead(200, { 'content-type': 'text/plain' });
