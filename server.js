@@ -139,6 +139,7 @@ function buildHeaders(req, host, ME, bodyLen) {
 
 function handleResponse(pr, req, res, host, ME, path) {
   const ct = String(pr.headers['content-type'] || '');
+  if (!path.startsWith('/videoplayback')) note('RES', pr.statusCode, host + path.slice(0, 50), ct.slice(0, 28), 'hdrBytes=' + JSON.stringify(pr.headers).length);
   const out = {};
   for (const [k, v] of Object.entries(pr.headers)) if (!DROP_RES.has(k)) out[k] = v;
   if (out.location) out.location = rewriteText(String(out.location), ME);
@@ -157,7 +158,7 @@ function handleResponse(pr, req, res, host, ME, path) {
 
   const chunks = [];
   pr.on('data', c => chunks.push(c));
-  pr.on('end', () => {
+  pr.on('end', () => { try {
     let text = Buffer.concat(chunks).toString('utf8');
     const isJson = /json/i.test(ct);
     if (isJson && /\/youtubei\/|\/api\//.test(path)) {
@@ -174,14 +175,21 @@ function handleResponse(pr, req, res, host, ME, path) {
     if (pr.statusCode === 200 && path.startsWith('/s/')) cacheSet(ME + host + path, { status: 200, out, body });
     res.writeHead(pr.statusCode, out);
     res.end(body);
-  });
-  pr.on('error', () => res.destroy());
+    note('SENT', pr.statusCode, 'body=' + body.length);
+  } catch (e) { note('[HANDLE ERROR]', e.message); if (!res.headersSent) { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('handle error: ' + e.message); } else res.destroy(); } });
+  pr.on('error', e => { note('[UPSTREAM BODY ERROR]', e.message); res.destroy(); });
 }
 
 
 // ---- never crash, always log (blitz logs tab will show these) ----
-process.on('uncaughtException', e => console.error('[uncaught]', e && e.stack || e));
-process.on('unhandledRejection', e => console.error('[unhandled]', e && e.stack || e));
+const LOGS = [];
+function note(...a) {
+  const line = new Date().toISOString().slice(11, 23) + ' ' + a.join(' ');
+  LOGS.push(line); if (LOGS.length > 120) LOGS.shift();
+  console.log(line);
+}
+process.on('uncaughtException', e => note('[UNCAUGHT]', String(e && e.stack || e).replace(/\n/g, ' | ')));
+process.on('unhandledRejection', e => note('[UNHANDLED]', String(e && e.stack || e).replace(/\n/g, ' | ')));
 
 // ---- /__diag : open in browser, shows WHY upstream fails (always HTTP 200 so Cloudflare shows the text) ----
 function probe(host) {
@@ -201,12 +209,41 @@ function probe(host) {
 const server = http.createServer((req, res) => {
   const ME = req.headers.host;
   const url = req.url;
+  if (!url.startsWith('/__') && !url.startsWith('/videoplayback')) note('REQ', req.method, url.slice(0, 70), '|', (req.headers['user-agent'] || '').slice(0, 45));
 
   if (url === '/__diag') {
     Promise.all([probe('www.youtube.com'), probe('m.youtube.com'), probe('googleapis.com')]).then(r => {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
+      res.end(JSON.stringify({ version: 'diag-3', recent_logs: LOGS.slice(-40), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
     });
+    return;
+  }
+  if (url.startsWith('/__try')) {
+    const q = new URL(url, 'http://x').searchParams;
+    const th = (q.get('h') || baseHost(req)).toLowerCase(), tp = q.get('p') || '/';
+    if (!ALLOW.test(th)) { res.writeHead(200, { 'content-type': 'text/plain' }); return res.end('blocked host'); }
+    const t0 = Date.now();
+    const done = o => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o, null, 2)); };
+    const r = https.request({ host: th, port: 443, method: 'GET', path: tp, agent, timeout: 20000, servername: th, headers: buildHeaders(req, th, ME) }, pr => {
+      const ch = [];
+      pr.on('data', c => ch.push(c));
+      pr.on('error', e => done({ stage: 'upstream body error', error: e.message }));
+      pr.on('end', () => {
+        try {
+          const raw = Buffer.concat(ch).toString('utf8');
+          const hdrs = {}; let total = 0;
+          for (const [k, v] of Object.entries(pr.headers)) { const l = JSON.stringify(v).length; total += k.length + l; hdrs[k] = l; }
+          const kept = Object.keys(pr.headers).filter(k => !DROP_RES.has(k));
+          done({ host: th, path: tp, status: pr.statusCode, ms: Date.now() - t0, content_type: pr.headers['content-type'] || null,
+            content_encoding: pr.headers['content-encoding'] || null, upstream_header_bytes: total, header_value_sizes: hdrs,
+            headers_we_would_send: kept, body_bytes: Buffer.byteLength(raw), rewritten_bytes: Buffer.byteLength(rewriteText(raw, ME)),
+            sent_request_headers: Object.keys(buildHeaders(req, th, ME)), body_start: raw.slice(0, 150) });
+        } catch (e) { done({ stage: 'processing error', error: e.stack }); }
+      });
+    });
+    r.on('timeout', () => r.destroy(new Error('timeout 20s')));
+    r.on('error', e => done({ stage: 'upstream request error', error: e.message, code: e.code }));
+    r.end();
     return;
   }
   if (url === '/__blocked') { res.writeHead(204); return res.end(); }
@@ -234,11 +271,11 @@ const server = http.createServer((req, res) => {
     const pq = https.request({ host, port: 443, method: req.method, path, headers, agent, servername: host }, pr => handleResponse(pr, req, res, host, ME, path));
     pq.setTimeout(30000, () => pq.destroy(new Error('upstream idle timeout 30s')));
     pq.on('error', e => {
-      console.error('[upstream error]', req.method, host + path.slice(0, 80), '->', e.code || '', e.message);
+      note('[UPSTREAM ERROR]', req.method, host + path.slice(0, 60), '->', e.code || '', e.message);
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
       res.end('proxy error: ' + e.message);
     });
-    res.on('close', () => pq.destroy());
+    res.on('close', () => { if (!res.writableEnded) note('[CLIENT CLOSED EARLY]', host + path.slice(0, 60)); pq.destroy(); });
     if (bodyBuf) pq.end(bodyBuf);
     else if (req.method === 'GET' || req.method === 'HEAD') pq.end();
     else req.pipe(pq);
