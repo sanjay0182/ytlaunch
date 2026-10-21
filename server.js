@@ -90,6 +90,43 @@ function trap(n){var v;try{Object.defineProperty(window,n,{configurable:true,get
 trap('ytInitialPlayerResponse');trap('ytInitialData');
 var op=JSON.parse;
 JSON.parse=function(){var r=op.apply(this,arguments);try{if(r&&typeof r==='object'&&(r.adPlacements||r.playerAds||r.adSlots))prune(r)}catch(e){}return r};
+var _go=0;
+function ping(m){try{(new Image()).src='/__hi?m='+encodeURIComponent(m)}catch(e){}}
+function navOK(){try{var t=Date.now(),a=JSON.parse(sessionStorage.getItem('__nav')||'[]').filter(function(x){return t-x<4000});a.push(t);sessionStorage.setItem('__nav',JSON.stringify(a));return a.length<4}catch(e){return true}}
+function K(){try{var p=new URLSearchParams(location.search);return location.pathname+'|'+(p.get('v')||'')+'|'+(p.get('search_query')||'')}catch(e){return location.pathname}}
+var _k=K();
+function go(u,why){_go=1;ping(why+' '+u);setTimeout(function(){_go=0},2000);location.assign(u)}
+ping('start '+location.pathname+location.search.slice(0,40));
+// 1) link clicks: do a normal page load instead of YouTube's in-page navigation (which stays blank behind the proxy)
+window.addEventListener('click',function(e){try{
+ if(e.button||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
+ var path=e.composedPath?e.composedPath():[e.target],a=null;
+ for(var i=0;i<path.length;i++){var el=path[i];if(el&&el.tagName==='A'&&el.href){a=el;break}}
+ if(!a||(a.target&&a.target!=='_self')||a.hasAttribute('download'))return;
+ var n=new URL(a.href,location.href);
+ if(n.origin!==location.origin||(n.pathname+n.search)===(location.pathname+location.search))return;
+ e.preventDefault();e.stopImmediatePropagation();go(n.href,'click');
+}catch(x){}},true);
+// 1b) search form: same thing (YouTube cancels the submit and then does its own request, which can fail)
+window.addEventListener('submit',function(e){try{
+ var f=e.target;if(!f||f.tagName!=='FORM'||String(f.getAttribute('method')||'get').toLowerCase()!=='get')return;
+ var n=new URL(f.getAttribute('action')||location.href,location.href);
+ if(n.origin!==location.origin||n.pathname!=='/results')return;
+ var p=new URLSearchParams();new FormData(f).forEach(function(v,k){if(typeof v==='string')p.append(k,v)});
+ n.search=p.toString();
+ if((n.pathname+n.search)===(location.pathname+location.search))return;
+ e.preventDefault();e.stopImmediatePropagation();go(n.href,'submit');
+}catch(x){}},true);
+// 2) pushState (search box, buttons ...): same thing
+var _ps=history.pushState;
+history.pushState=function(st,ti,u){
+ try{if(u){u=fix(String(u));arguments[2]=u;var n=new URL(u,location.href);
+  if(n.origin===location.origin&&(n.pathname+n.search)!==(location.pathname+location.search)&&navOK()){go(n.href,'push');return}}}catch(e){}
+ return _ps.apply(this,arguments)};
+var _rs=history.replaceState;
+history.replaceState=function(st,ti,u){try{if(u)arguments[2]=fix(String(u))}catch(e){}return _rs.apply(this,arguments)};
+// 3) safety net, any other way YouTube changes the page address (page, video id or search text): reload = same as manual refresh
+setInterval(function(){if(_go)return;var k=K();if(k!==_k){_k=k;if(navOK()){_go=1;ping('reload '+location.pathname);location.reload()}}},250);
 })();`;
 
 const DROP_RES = new Set([
@@ -144,7 +181,7 @@ function buildHeaders(req, host, ME, bodyLen) {
 
 function handleResponse(pr, req, res, host, ME, path) {
   const ct = String(pr.headers['content-type'] || '');
-  if (!path.startsWith('/videoplayback')) note('RES', pr.statusCode, host + path.slice(0, 50), ct.slice(0, 28), 'hdrBytes=' + JSON.stringify(pr.headers).length + '->' + Object.entries(pr.headers).filter(([k, v]) => KEEP_RES.has(k)).reduce((a, [k, v]) => a + k.length + JSON.stringify(v).length, 0) + (pr.headers.location ? ' LOC=' + String(pr.headers.location).slice(0, 90) : ''));
+  if (!path.startsWith('/videoplayback')) note('RES', pr.statusCode, host + path.slice(0, pr.statusCode >= 400 ? 170 : 50), ct.slice(0, 28), 'hdrBytes=' + JSON.stringify(pr.headers).length + '->' + Object.entries(pr.headers).filter(([k, v]) => KEEP_RES.has(k)).reduce((a, [k, v]) => a + k.length + JSON.stringify(v).length, 0) + (pr.headers.location ? ' LOC=' + String(pr.headers.location).slice(0, 90) : ''));
   const out = {};
   for (const [k, v] of Object.entries(pr.headers)) if (KEEP_RES.has(k) && JSON.stringify(v).length < 4200) out[k] = v;
   if (out.location) out.location = rewriteText(String(out.location), ME);
@@ -228,7 +265,7 @@ const server = http.createServer((req, res) => {
   if (url === '/__diag') {
     Promise.all([probe('www.youtube.com'), probe('m.youtube.com'), probe('googleapis.com')]).then(r => {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ version: 'diag-6', recent_logs: LOGS.slice(-40), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
+      res.end(JSON.stringify({ version: 'diag-9', recent_logs: LOGS.slice(-40), node: process.version, env_PORT: process.env.PORT || null, listening: LISTEN_PORTS, your_host_header: req.headers.host, probes: r }, null, 2));
     });
     return;
   }
@@ -260,6 +297,7 @@ const server = http.createServer((req, res) => {
     r.end();
     return;
   }
+  if (url.startsWith('/__hi')) { note('[CLIENT]', decodeURIComponent(url.slice(8)).slice(0, 120)); res.writeHead(204); return res.end(); }
   if (url === '/__blocked') { res.writeHead(204); return res.end(); }
   if (url === '/' && /uptime check/i.test(req.headers['user-agent'] || '')) {
     res.writeHead(200, { 'content-type': 'text/plain' });
@@ -287,7 +325,8 @@ const server = http.createServer((req, res) => {
   // (otherwise the rewritten redirect points back at this proxy and loops forever in the browser)
   const run = (h, hop, bodyBuf) => {
     const headers = buildHeaders(req, h, ME, bodyBuf ? bodyBuf.length : undefined);
-    const pq = https.request({ host: h, port: 443, method: req.method, path, headers, agent, servername: h }, pr => {
+    const upPath = ME ? path.split(ME).join(baseHost(req)) : path;
+    const pq = https.request({ host: h, port: 443, method: req.method, path: upPath, headers, agent, servername: h }, pr => {
       const sc = pr.statusCode, loc = pr.headers.location;
       if (hop < 4 && loc && sc >= 301 && sc <= 308 && !bodyBuf && (req.method === 'GET' || req.method === 'HEAD')) {
         let u = null; try { u = new URL(loc, 'https://' + h); } catch (e) { /* ignore */ }
